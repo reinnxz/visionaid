@@ -8,27 +8,27 @@ A Python-based assistive vision system using **YOLOv8**, **VOSK**, and **BLIP** 
   - **“describe”** → takes a snapshot and verbally describes surroundings.
 - Keeps the camera window open at all times with live overlay status.
 
-## ⚙️ Setup Instructions
+##  Setup Instructions
 
-### 1️⃣ Clone the repository
+### 1️Clone the repository
 ```bash
 git clone https://github.com/YOUR_USERNAME/vision-aid.git
 cd vision-aid
 ```
 
-### 2️⃣ Create virtual environment
+### 2️ Create virtual environment
 ```bash
 python -m venv venv
 source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate   # Windows
 ```
 
-### 3️⃣ Install dependencies
+### 3️ Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4️⃣ Download VOSK model
+### 4️ Download VOSK model
 Download from:
 https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
 
