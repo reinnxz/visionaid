@@ -12,8 +12,8 @@ A Python-based assistive vision system using **YOLOv8**, **VOSK**, and **BLIP** 
 
 ### 1️Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/vision-aid.git
-cd vision-aid
+git clone https://github.com/reinnxz/visionaid
+cd visionaid
 ```
 
 ### 2️ Create virtual environment
