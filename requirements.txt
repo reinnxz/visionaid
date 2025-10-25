@@ -1,0 +1,9 @@
+ultralytics==8.2.100
+transformers==4.44.2
+torch==2.3.0
+Pillow==10.3.0
+numpy==1.26.4
+opencv-python==4.10.0.84
+pyttsx3==2.90
+sounddevice==0.4.6
+vosk==0.3.45
