@@ -1,0 +1,813 @@
+import os
+import time
+import json
+import queue
+import threading
+import numpy as np
+import cv2
+import pyttsx3
+from PIL import Image
+import torch
+import base64
+import io
+
+from ultralytics import YOLO
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from vosk import Model as VoskModel, KaldiRecognizer
+import sounddevice as sd
+import google.generativeai as genai
+
+#configurations
+VOSK_MODEL_PATH = os.path.expanduser("~/models/vosk/vosk-model-small-en-us-0.15")
+CAMERA_INDEX = 0
+FRAME_WIDTH = 460
+FRAME_HEIGHT = 460
+FOCAL_LENGTH = 700.0
+KNOWN_WIDTHS = {"person": 0.5, "car": 1.8, "bicycle": 0.5, "motorbike": 0.6, "truck": 2.5, "bus": 2.5}
+DETECTION_CONF = 0.55
+
+COLLISION_DISTANCE = 2.0
+AREA_TRIGGER_RATIO = 0.25
+OBSTACLE_COOLDOWN = 5.0
+VOICE_TRIGGER_COOLDOWN = 2.0
+
+# Performance settings
+USE_OPENVINO = True  # Set to True if OpenVINO is installed
+SKIP_FRAMES = 2  # Process every Nth frame for detection (1 = every frame, 2 = every other frame)
+
+# Voice commands
+LISTEN_PHRASES = ["what am i seeing", "describe", "what do i see", "stop", "start", "jarvis", "alpha"]
+
+# Jarvis mode commands
+JARVIS_COMMANDS = {
+    "read": ["read", "read text", "what does it say"],
+    "safety": ["is this safe", "safe to walk", "check safety", "any danger"],
+    "navigation": ["where is", "find the", "locate"],
+    "product": ["what is this", "identify this", "what product"],
+    "currency": ["how much money", "what money", "count money", "currency"],
+    "answer": ["answer"]
+}
+
+# VAD params
+AUDIO_RATE = 16000
+AUDIO_BLOCKSIZE = 2000
+RMS_THRESHOLD = 250
+VOICE_BAND_MIN = 300
+VOICE_BAND_MAX = 3000
+VOICE_BAND_RATIO_THRESHOLD = 0.12
+
+# Gemini API Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "you_api_key")  # Set your API key
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+# ---------------- Initialization ----------------
+tts_engine = pyttsx3.init()
+tts_engine.setProperty("rate", 170)
+tts_engine.setProperty("volume", 1.0)
+
+# Initialize YOLO with Intel optimization
+print("YOLO gonna run")
+model = "yolov8n"
+if USE_OPENVINO:
+    try:
+        # Export to OpenVINO format for Intel GPU acceleration
+        yolo_model = YOLO( model + ".pt")
+        openvino_model_path = "yolov8n_openvino_model"
+        if not os.path.exists(openvino_model_path):
+            print("Exporting model to OpenVINO format (one-time setup)...")
+            yolo_model.export(format="openvino", half=False)
+        yolo_model = YOLO(openvino_model_path)
+        print("Using OpenVINO acceleration for Intel GPU")
+    except Exception as e:
+        print(f"OpenVINO export failed: {e}")
+        print("Falling back to standard model")
+        yolo_model = YOLO(model + ".pt")
+        USE_OPENVINO = False
+else:
+    yolo_model = YOLO( model + ".pt")
+    yolo_model.fuse()
+
+# Device selection - prefer CPU for Intel iGPU with OpenVINO
+if USE_OPENVINO:
+    device = torch.device("cpu")  # OpenVINO handles GPU internally
+    print("OpenVINO will use Intel iGPU automatically")
+else:
+    device = torch.device("cpu")
+    print("Using CPU inference")
+
+# Initialize BLIP with optimizations
+print("Loading BLIP model...")
+blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+blip_model = BlipForConditionalGeneration.from_pretrained(
+    "Salesforce/blip-image-captioning-base"
+).to(device)
+blip_model.eval()
+
+if not os.path.isdir(VOSK_MODEL_PATH):
+    raise SystemExit(f"VOSK model not found at {VOSK_MODEL_PATH}")
+vosk_model = VoskModel(VOSK_MODEL_PATH)
+
+audio_q = queue.Queue()
+tts_queue = queue.Queue()
+listening_flag = False
+last_voice_trigger = 0.0
+last_obstacle_alert = 0.0
+caption_busy = threading.Event()
+caption_request_event = threading.Event()
+jarvis_request_event = threading.Event()
+jarvis_command_queue = queue.Queue()
+jarvis_processing = threading.Event()  # Flag to track if Jarvis is currently processing
+alpha_mode_queue = queue.Queue()  # Queue for Alpha mode text-only queries
+tts_lock = threading.Lock()
+
+# control flags
+system_active = True
+stop_requested = False
+jarvis_mode = False
+alpha_mode = False  # New Alpha mode for text-only Q&A
+
+# Cache for detection results
+last_detection_results = []
+last_detection_frame = 0
+
+# ---------------- Asynchronous TTS Thread ----------------
+def tts_worker():
+    while True:
+        try:
+            item = tts_queue.get(timeout=0.5)
+            if item is None:
+                break
+            text, mode = item
+            try:
+                with tts_lock:
+                    # Set speech rate based on mode
+                    if mode == "jarvis":
+                        tts_engine.setProperty("rate", 160)
+                    else:
+                        tts_engine.setProperty("rate", 170)
+                    
+                    tts_engine.say(text)
+                    tts_engine.runAndWait()
+            except Exception as e:
+                print("TTS error:", e)
+            tts_queue.task_done()
+        except queue.Empty:
+            continue
+
+tts_thread = threading.Thread(target=tts_worker, daemon=True)
+tts_thread.start()
+
+# ---------------- TTS ----------------
+def speak_text(text, force=False, priority=False, mode="normal"):
+    if stop_requested and not force and not jarvis_mode:
+        return
+    if priority:
+        while not tts_queue.empty():
+            try:
+                tts_queue.get_nowait()
+            except queue.Empty:
+                break
+    tts_queue.put((text, mode))
+
+def stop_all_speech():
+    """Immediately stop all ongoing speech"""
+    with tts_lock:
+        try:
+            tts_engine.stop()
+        except:
+            pass
+    # Clear queue
+    while not tts_queue.empty():
+        try:
+            tts_queue.get_nowait()
+        except queue.Empty:
+            break
+
+# ---------------- Gemini Vision Functions ----------------
+def encode_image_to_base64(image_bgr):
+    """Convert BGR image to base64 for Gemini API"""
+    try:
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(image_rgb)
+        buffered = io.BytesIO()
+        pil_img.save(buffered, format="JPEG")
+        return base64.b64encode(buffered.getvalue()).decode()
+    except Exception as e:
+        print(f"Image encoding error: {e}")
+        return None
+
+def query_gemini_with_image(image_bgr, prompt):
+    """Send image and prompt to Gemini API"""
+    try:
+        # Convert BGR to RGB for PIL
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(image_rgb)
+        
+        # Generate response
+        response = gemini_model.generate_content([prompt, pil_img])
+        return response.text
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+        return f"Sorry, I encountered an error: {str(e)}"
+
+def query_gemini_text_only(question):
+    """Send text-only query to Gemini API (Alpha mode)"""
+    try:
+        response = gemini_model.generate_content(f"Answer this question in exactly 1 sentence, be concise: {question}")
+        return response.text
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+        return f"Sorry, I encountered an error: {str(e)}"
+
+def handle_jarvis_command(command_text, image_bgr):
+    """Process Jarvis mode commands with Gemini - ONE RESPONSE ONLY"""
+    command_lower = command_text.lower()
+    
+    # Set processing flag to prevent multiple responses
+    jarvis_processing.set()
+    
+    try:
+        # Read text command
+        if any(cmd in command_lower for cmd in JARVIS_COMMANDS["read"]):
+            prompt = """Extract and read all visible text from this image. Answer in maximum 2 sentences.
+            If there's no text, say 'No readable text visible.'"""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+        
+        # Safety assessment
+        elif any(cmd in command_lower for cmd in JARVIS_COMMANDS["safety"]):
+            prompt = """Analyze safety in maximum 2 sentences: Is it safe? What's the main hazard if any?"""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+        
+        # Navigation assistance
+        elif any(cmd in command_lower for cmd in JARVIS_COMMANDS["navigation"]):
+            # Extract what user is looking for
+            search_term = command_lower.split("where is")[-1].split("find")[-1].strip()
+            prompt = f"""Locate {search_term} in maximum 2 sentences: direction and distance only."""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+        
+        # Product recognition
+        elif any(cmd in command_lower for cmd in JARVIS_COMMANDS["product"]):
+            prompt = """Identify product in maximum 2 sentences: name, brand, and most important detail only."""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+        
+        # Currency recognition
+        elif any(cmd in command_lower for cmd in JARVIS_COMMANDS["currency"]):
+            prompt = """Identify currency in maximum 2 sentences: denomination and total value only."""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+        
+        # Smart Q&A
+        elif "answer" in command_lower:
+            # Extract question after "answer"
+            question = command_lower.split("answer", 1)[-1].strip()
+            prompt = f"""Answer this question in maximum 2 sentences based on the image: {question}"""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+        
+        else:
+            # General description for unrecognized commands
+            prompt = """Describe what you see in maximum 2 sentences: main objects and key details only."""
+            response = query_gemini_with_image(image_bgr, prompt)
+            speak_text(response, force=True, priority=True, mode="jarvis")
+    finally:
+        # Clear processing flag after response is queued
+        jarvis_processing.clear()
+
+# ---------------- Jarvis Processing Thread ----------------
+def jarvis_worker():
+    """Background thread to process Jarvis commands"""
+    while True:
+        try:
+            command, image = jarvis_command_queue.get(timeout=0.5)
+            if command is None:
+                break
+            handle_jarvis_command(command, image)
+            jarvis_command_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Jarvis worker error: {e}")
+
+jarvis_thread = threading.Thread(target=jarvis_worker, daemon=True)
+jarvis_thread.start()
+
+# ---------------- Alpha Mode Processing Thread ----------------
+def alpha_mode_worker():
+    """Background thread to process Alpha mode text-only queries"""
+    while True:
+        try:
+            question = alpha_mode_queue.get(timeout=0.5)
+            if question is None:
+                break
+            
+            jarvis_processing.set()
+            try:
+                response = query_gemini_text_only(question)
+                speak_text(response, force=True, priority=True, mode="jarvis")
+            finally:
+                jarvis_processing.clear()
+            
+            alpha_mode_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Alpha mode worker error: {e}")
+
+alpha_thread = threading.Thread(target=alpha_mode_worker, daemon=True)
+alpha_thread.start()
+
+# ---------------- Control Window Functions ----------------
+def create_control_window():
+    """Create a control panel window with mode buttons"""
+    control_window = np.zeros((400, 300, 3), dtype=np.uint8)
+    return control_window
+
+def draw_control_panel(current_mode):
+    """Draw the control panel with buttons"""
+    panel = np.zeros((400, 300, 3), dtype=np.uint8)
+    
+    # Title
+    cv2.putText(panel, "CONTROL PANEL", (50, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # Button definitions: (y_pos, text, mode_check, active_color, inactive_color)
+    buttons = [
+        (100, "1 - START MODE", current_mode == "start", (0, 255, 0), (0, 100, 0)),
+        (170, "2 - STOP MODE", current_mode == "stop", (0, 0, 255), (0, 0, 100)),
+        (240, "3 - JARVIS MODE", current_mode == "jarvis", (255, 0, 255), (100, 0, 100)),
+        (310, "4 - ALPHA MODE", current_mode == "alpha", (255, 165, 0), (100, 65, 0))
+    ]
+    
+    for y_pos, text, is_active, active_color, inactive_color in buttons:
+        color = active_color if is_active else inactive_color
+        # Draw button rectangle
+        cv2.rectangle(panel, (20, y_pos - 35), (280, y_pos + 15), color, -1)
+        cv2.rectangle(panel, (20, y_pos - 35), (280, y_pos + 15), (255, 255, 255), 2)
+        
+        # Draw button text
+        text_color = (255, 255, 255) if is_active else (150, 150, 150)
+        cv2.putText(panel, text, (35, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+    
+    # Instructions
+    cv2.putText(panel, "Press Q to Quit", (70, 380),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    return panel
+
+def mouse_callback(event, x, y, flags, param):
+    """Handle mouse clicks on control panel"""
+    global stop_requested, system_active, jarvis_mode, alpha_mode
+    
+    if event == cv2.EVENT_LBUTTONDOWN:
+        # Button 1 - Start Mode (y: 65-115)
+        if 20 <= x <= 280 and 65 <= y <= 115:
+            stop_all_speech()
+            stop_requested = False
+            system_active = True
+            jarvis_mode = False
+            alpha_mode = False
+            speak_text("Started", force=True, priority=True, mode="normal")
+        
+        # Button 2 - Stop Mode (y: 135-185)
+        elif 20 <= x <= 280 and 135 <= y <= 185:
+            stop_all_speech()
+            stop_requested = True
+            system_active = False
+            jarvis_mode = False
+            alpha_mode = False
+            speak_text("Stopped", force=True, priority=True, mode="normal")
+        
+        # Button 3 - Jarvis Mode (y: 205-255)
+        elif 20 <= x <= 280 and 205 <= y <= 255:
+            stop_all_speech()
+            jarvis_mode = True
+            alpha_mode = False
+            system_active = False
+            stop_requested = True
+            speak_text("Jarvis mode", force=True, priority=True, mode="jarvis")
+        
+        # Button 4 - Alpha Mode (y: 275-325)
+        elif 20 <= x <= 280 and 275 <= y <= 325:
+            stop_all_speech()
+            alpha_mode = True
+            jarvis_mode = False
+            system_active = False
+            stop_requested = True
+            speak_text("Alpha mode", force=True, priority=True, mode="jarvis")
+
+# ---------------- VAD callback ----------------
+def audio_callback(indata, frames, time_info, status):
+    try:
+        audio_data = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
+    except Exception:
+        return
+
+    rms = np.sqrt(np.mean(np.square(audio_data)))
+    if rms < RMS_THRESHOLD:
+        return
+
+    fft = np.fft.rfft(audio_data)
+    fft_mag = np.abs(fft)
+    freqs = np.fft.rfftfreq(len(audio_data), d=1.0 / AUDIO_RATE)
+    total_energy = np.sum(fft_mag) + 1e-9
+    voice_band_mask = (freqs >= VOICE_BAND_MIN) & (freqs <= VOICE_BAND_MAX)
+    voice_energy = np.sum(fft_mag[voice_band_mask])
+    ratio = voice_energy / total_energy
+
+    if ratio >= VOICE_BAND_RATIO_THRESHOLD:
+        audio_q.put(bytes(indata))
+
+# ---------------- VOSK listener ----------------
+def vosk_listener_loop(trigger_callback):
+    global listening_flag, last_voice_trigger, stop_requested, system_active, jarvis_mode, alpha_mode
+    try:
+        rec = KaldiRecognizer(vosk_model, AUDIO_RATE)
+        while True:
+            data = audio_q.get()
+            if data is None:
+                break
+            if rec.AcceptWaveform(data):
+                try:
+                    res = json.loads(rec.Result())
+                    text = res.get("text", "").strip().lower()
+                except Exception:
+                    text = ""
+                if text:
+                    now = time.time()
+                    
+                    # Priority commands - no cooldown, instant mode switching
+                    if "alpha" in text and not any(word in text for word in ["stop", "start", "jarvis"]):
+                        stop_all_speech()
+                        alpha_mode = True
+                        jarvis_mode = False
+                        system_active = False
+                        stop_requested = True
+                        speak_text("Alpha mode", force=True, priority=True, mode="jarvis")
+                        last_voice_trigger = now
+                        continue
+
+                    if "jarvis" in text:
+                        stop_all_speech()  # Stop any ongoing speech immediately
+                        jarvis_mode = True
+                        alpha_mode = False
+                        system_active = False
+                        stop_requested = True
+                        speak_text("Jarvis mode", force=True, priority=True, mode="jarvis")
+                        last_voice_trigger = now
+                        continue
+
+                    if "stop" in text:
+                        stop_all_speech()  # Stop any ongoing speech immediately
+                        stop_requested = True
+                        system_active = False
+                        jarvis_mode = False
+                        alpha_mode = False
+                        speak_text("Stopped", force=True, priority=True, mode="normal")
+                        last_voice_trigger = now
+                        continue
+
+                    if "start" in text:
+                        stop_all_speech()  # Stop any ongoing speech immediately
+                        stop_requested = False
+                        system_active = True
+                        jarvis_mode = False
+                        alpha_mode = False
+                        speak_text("Started", force=True, priority=True, mode="normal")
+                        last_voice_trigger = now
+                        continue
+
+                    # Cooldown for other commands
+                    if now - last_voice_trigger < VOICE_TRIGGER_COOLDOWN:
+                        continue
+                    last_voice_trigger = now
+
+                    # Alpha mode commands - text-only Q&A
+                    if alpha_mode:
+                        if not jarvis_processing.is_set():
+                            alpha_mode_queue.put(text)
+                        continue
+
+                    # Jarvis mode commands
+                    if jarvis_mode:
+                        # Only process if not already processing a command
+                        if not jarvis_processing.is_set():
+                            jarvis_request_event.set()
+                            jarvis_request_event.command = text
+                        continue
+
+                    # Normal mode describe command
+                    if "describe" in text or "what am i seeing" in text or "what do i see" in text:
+                        caption_request_event.set()
+                        continue
+    except Exception as e:
+        print("VOSK listener error:", e)
+
+# BLIP caption 
+def run_caption_and_speak(snapshot_bgr):
+    if caption_busy.is_set():
+        return
+    caption_busy.set()
+    try:
+        # Resize for faster processing
+        snapshot_bgr = cv2.resize(snapshot_bgr, (320, 240))
+        pil_img = Image.fromarray(cv2.cvtColor(snapshot_bgr, cv2.COLOR_BGR2RGB)).convert("RGB")
+        
+        inputs = blip_processor(images=pil_img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = blip_model.generate(**inputs, max_length=40, num_beams=2)
+        caption = blip_processor.decode(out[0], skip_special_tokens=True)
+        msg = f"You are seeing: {caption}" if caption else "I can't describe that clearly."
+        speak_text(msg, force=True, priority=True, mode="normal")
+    except Exception as e:
+        print("Caption error:", e)
+    finally:
+        caption_busy.clear()
+
+#Start audio stream 
+def start_audio_stream():
+    try:
+        stream = sd.RawInputStream(
+            samplerate=AUDIO_RATE,
+            blocksize=AUDIO_BLOCKSIZE,
+            dtype="int16",
+            channels=1,
+            callback=audio_callback,
+        )
+        stream.start()
+        return stream
+    except Exception as e:
+        print("Failed to start audio stream:", e)
+        return None
+
+# Main detection loop 
+def main_loop():
+    global last_obstacle_alert, last_detection_results, last_detection_frame
+    global stop_requested, system_active, jarvis_mode, alpha_mode
+    try:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            raise SystemExit(f"Cannot open camera {CAMERA_INDEX}")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Create control panel window
+        cv2.namedWindow("Control Panel")
+        cv2.setMouseCallback("Control Panel", mouse_callback)
+
+        print(f"Vision Aid started (Skip frames: {SKIP_FRAMES}, OpenVINO: {USE_OPENVINO})")
+        print("Say 'start', 'stop', 'jarvis', 'alpha' or press keys: 1=start, 2=stop, 3=jarvis, 4=alpha, q=quit")
+        
+        frame_count = 0
+        fps_time = time.time()
+        fps_counter = 0
+        current_fps = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            frame_count += 1
+            fps_counter += 1
+            
+            # Calculate FPS
+            if time.time() - fps_time > 1.0:
+                current_fps = fps_counter
+                fps_counter = 0
+                fps_time = time.time()
+            
+            proc_frame = frame.copy()
+            detection_results = []
+
+            # Handle Jarvis mode requests
+            if jarvis_mode and jarvis_request_event.is_set() and not jarvis_processing.is_set():
+                jarvis_request_event.clear()
+                command = getattr(jarvis_request_event, 'command', '')
+                snapshot = frame.copy()
+                jarvis_command_queue.put((command, snapshot))
+
+            # Normal detection mode
+            if system_active and not jarvis_mode:
+                # Only run detection every Nth frame for performance
+                if frame_count % SKIP_FRAMES == 0:
+                    results = yolo_model(proc_frame, conf=DETECTION_CONF, verbose=False, imgsz=640)
+                    detection_results = []
+                    
+                    for r in results:
+                        for box in r.boxes:
+                            cls = int(box.cls[0])
+                            name = yolo_model.names[cls]
+                            conf = float(box.conf[0])
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            detection_results.append((name, conf, x1, y1, x2, y2))
+                    
+                    last_detection_results = detection_results
+                    last_detection_frame = frame_count
+                else:
+                    # Use cached results for display
+                    detection_results = last_detection_results
+
+                nearest_obj = None
+                nearest_dist = float("inf")
+                area_trigger = False
+
+                for name, conf, x1, y1, x2, y2 in detection_results:
+                    w = x2 - x1
+                    h = y2 - y1
+                    area_ratio = (w * h) / (FRAME_WIDTH * FRAME_HEIGHT)
+                    
+                    if area_ratio > AREA_TRIGGER_RATIO:
+                        color = (0, 0, 255)
+                    else:
+                        color = (0, 255, 0)
+                    
+                    cv2.rectangle(proc_frame, (x1, y1), (x2, y2), color, 2)
+
+                    if name in KNOWN_WIDTHS and w > 0:
+                        dist = (KNOWN_WIDTHS[name] * FOCAL_LENGTH) / float(w)
+                    else:
+                        dist = None
+
+                    cx = (x1 + x2) // 2
+                    dir_text = "ahead"
+                    if cx < FRAME_WIDTH / 3:
+                        dir_text = "left"
+                    elif cx > 2 * FRAME_WIDTH / 3:
+                        dir_text = "right"
+
+                    label = f"{name} {conf:.2f}"
+                    if dist:
+                        label += f" {dist:.1f}m"
+                    cv2.putText(proc_frame, label, (x1, max(0, y1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                    if area_ratio > AREA_TRIGGER_RATIO:
+                        area_trigger = True
+
+                    if dist and dist < nearest_dist:
+                        nearest_dist = dist
+                        nearest_obj = (name, dist, dir_text)
+
+                now = time.time()
+                if not stop_requested and frame_count % SKIP_FRAMES == 0:
+                    collision = False
+                    message = None
+                    if nearest_obj and nearest_obj[1] <= COLLISION_DISTANCE:
+                        collision = True
+                        message = f"{nearest_obj[0]} {nearest_obj[1]:.1f} meters {nearest_obj[2]}"
+                    elif area_trigger:
+                        collision = True
+                        message = "Obstacle very close ahead"
+
+                    if collision and (now - last_obstacle_alert > OBSTACLE_COOLDOWN):
+                        last_obstacle_alert = now
+                        speak_text("Warning: " + message, priority=True, mode="normal")
+
+            # Display info overlay
+            if alpha_mode:
+                mode_text = "ALPHA MODE (Q&A ONLY)"
+                color = (255, 165, 0)  # Orange for Alpha mode
+                current_mode = "alpha"
+            elif jarvis_mode:
+                mode_text = "JARVIS MODE"
+                color = (255, 0, 255)  # Magenta for Jarvis
+                current_mode = "jarvis"
+            elif system_active:
+                mode_text = "RUNNING"
+                color = (0, 255, 0)
+                current_mode = "start"
+            else:
+                mode_text = "STOPPED"
+                color = (0, 0, 255)
+                current_mode = "stop"
+            
+            # Update control panel
+            control_panel = draw_control_panel(current_mode)
+            cv2.imshow("Control Panel", control_panel)
+            
+            cv2.putText(proc_frame, mode_text, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+            
+            # Show FPS and optimization info (only if not in Alpha mode)
+            if not alpha_mode:
+                info_text = f"FPS: {current_fps} | {'OpenVINO' if USE_OPENVINO else 'CPU'}"
+                cv2.putText(proc_frame, info_text, (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+            # Handle description requests (only in non-Jarvis and non-Alpha mode)
+            if not jarvis_mode and not alpha_mode and caption_request_event.is_set() and not caption_busy.is_set():
+                caption_request_event.clear()
+                snapshot = frame.copy()
+                threading.Thread(target=run_caption_and_speak, args=(snapshot,), daemon=True).start()
+
+            # Only show window if not in Alpha mode
+            if not alpha_mode:
+                cv2.imshow("Vision Aid", proc_frame)
+            else:
+                # In Alpha mode, destroy window if it exists
+                try:
+                    cv2.destroyWindow("Vision Aid")
+                except:
+                    pass
+            
+            # Check for keyboard input from either window
+            key = cv2.waitKey(1) & 0xFF
+            
+            # Keyboard shortcuts for mode switching
+            if key == ord("q"):
+                break
+            elif key == ord("1"):
+                # Start mode
+                stop_all_speech()
+                stop_requested = False
+                system_active = True
+                jarvis_mode = False
+                alpha_mode = False
+                speak_text("Started", force=True, priority=True, mode="normal")
+            elif key == ord("2"):
+                # Stop mode
+                stop_all_speech()
+                stop_requested = True
+                system_active = False
+                jarvis_mode = False
+                alpha_mode = False
+                speak_text("Stopped", force=True, priority=True, mode="normal")
+            elif key == ord("3"):
+                # Jarvis mode
+                stop_all_speech()
+                jarvis_mode = True
+                alpha_mode = False
+                system_active = False
+                stop_requested = True
+                speak_text("Jarvis mode", force=True, priority=True, mode="jarvis")
+            elif key == ord("4"):
+                # Alpha mode
+                stop_all_speech()
+                alpha_mode = True
+                jarvis_mode = False
+                system_active = False
+                stop_requested = True
+                speak_text("Alpha mode", force=True, priority=True, mode="jarvis")
+
+    except Exception as e:
+        print("Main loop error:", e)
+    finally:
+        try:
+            cap.release()
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+# Entry Point
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Vision Aid with Jarvis Mode")
+    print("=" * 60)
+    print("\nVoice Commands:")
+    print("  'start'  - Start obstacle detection (Rate: 170 WPM)")
+    print("  'stop'   - Stop obstacle detection")
+    print("  'jarvis' - Toggle Jarvis AI mode (Rate: 150 WPM)")
+    print("  'alpha'  - Text-only Q&A mode, no camera (Rate: 150 WPM)")
+    print("\nKeyboard Shortcuts:")
+    print("  1 - Start mode")
+    print("  2 - Stop mode")
+    print("  3 - Jarvis mode")
+    print("  4 - Alpha mode")
+    print("  Q - Quit program")
+    print("\nJarvis Mode Commands:")
+    print("  'read text' - Extract and read all visible text")
+    print("  'is this safe?' - Get safety assessment")
+    print("  'where is [item]?' - Find objects and get directions")
+    print("  'what is this?' - Identify products with details")
+    print("  'how much money?' - Recognize currency")
+    print("  'answer [question]' - Ask any question about the scene")
+    print("\nAlpha Mode:")
+    print("  Ask any question - Get 1-sentence answers")
+    print("  No camera processing, pure Q&A mode")
+    print("=" * 60)
+    print(f"\nAPI Key Status: {'✓ Configured' if GEMINI_API_KEY != 'YOUR_API_KEY_HERE' else '✗ Not configured'}")
+    print("\nStarting system...\n")
+    
+    stream = start_audio_stream()
+    if stream:
+        vosk_thread = threading.Thread(target=vosk_listener_loop,
+                                       args=(lambda: caption_request_event.set(),), daemon=True)
+        vosk_thread.start()
+        main_loop()
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        tts_queue.put(None)
+        jarvis_command_queue.put((None, None))
+        alpha_mode_queue.put(None)
+    print("Exiting program.")
